@@ -105,7 +105,19 @@ jobs:
 
               fs.writeFileSync('files.txt', filesList);
 
-              console.log(`📝 Generated commits.txt and files.txt`);
+              // Get the actual diff
+              const { data: diff } = await github.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                mediaType: {
+                  format: 'diff'
+                }
+              });
+
+              fs.writeFileSync('pr.diff', diff);
+
+              console.log(`📝 Generated commits.txt, files.txt, and pr.diff`);
 
             } catch (error) {
               core.setFailed(`❌ Failed to fetch PR details: ${error.message}`);
@@ -128,6 +140,9 @@ jobs:
 
             **Changed Files:**
             $(cat files.txt)
+
+            **Diff:**
+            $(cat pr.diff)
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           timeout: 300000 # 5 minutes
 
@@ -212,5 +227,5 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          rm -f commits.txt files.txt || true
+          rm -f commits.txt files.txt pr.diff || true
           echo "🧹 Cleaned up temporary files"
