@@ -15,7 +15,7 @@ inputs:
   cagent-version:
     description: "Version of cagent to use"
     required: false
-    default: "v1.15.6"
+    default: "v1.19.4"
   mcp-gateway:
     description: "Install mcp-gateway (true/false)"
     required: false
@@ -305,7 +305,7 @@ runs:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key || env.ANTHROPIC_API_KEY }}
         OPENAI_API_KEY: ${{ inputs.openai-api-key || env.OPENAI_API_KEY }}
         GOOGLE_API_KEY: ${{ inputs.google-api-key || env.GOOGLE_API_KEY }}
-        GITHUB_PERSONAL_ACCESS_TOKEN: ${{ inputs.github-token || github.token }}
+        GH_TOKEN: ${{ inputs.github-token || github.token }}
         AGENT: ${{ inputs.agent }}
         PROMPT_INPUT: ${{ inputs.prompt }}
         ACTION_PATH: ${{ github.action_path }}
@@ -473,6 +473,15 @@ runs:
             tail -n +$((AGENT_LINE + 1)) "$OUTPUT_FILE" | \
               grep -v "^time=" | \
               grep -v "^level=" | \
+              grep -v "^msg=" | \
+              grep -v "^--- Agent:" | \
+              grep -v "^--- Tool:" | \
+              grep -v "^<thinking>" | \
+              grep -v "^</thinking>" | \
+              grep -v "^\[thinking\]" | \
+              grep -v "^\[/thinking\]" | \
+              grep -v "^Thinking:" | \
+              grep -v "^> \[!NOTE\]" | \
               grep -v "For any feedback" | \
               sed '/^$/N;/^\n$/d' > "${OUTPUT_FILE}.clean"
 
@@ -486,6 +495,15 @@ runs:
         else
           grep -v "^time=" "$OUTPUT_FILE" | \
             grep -v "^level=" | \
+            grep -v "^msg=" | \
+            grep -v "^--- Agent:" | \
+            grep -v "^--- Tool:" | \
+            grep -v "^<thinking>" | \
+            grep -v "^</thinking>" | \
+            grep -v "^\[thinking\]" | \
+            grep -v "^\[/thinking\]" | \
+            grep -v "^Thinking:" | \
+            grep -v "^> \[!NOTE\]" | \
             grep -v "For any feedback" > "${OUTPUT_FILE}.clean"
 
           echo "⚠️  No extraction markers found - cleaned metadata only"
