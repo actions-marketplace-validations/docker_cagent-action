@@ -1,5 +1,5 @@
-name: "CAgent Runner"
-description: "Run a CAgent AI agent with a single line"
+name: "cagent Runner"
+description: "Run a cagent AI agent with a single line"
 author: "Docker"
 branding:
   icon: "cpu"
@@ -12,10 +12,6 @@ inputs:
   prompt:
     description: "Prompt to pass to the agent. If not provided, uses a default based on the agent type"
     required: false
-  cagent-version:
-    description: "Version of cagent to use"
-    required: false
-    default: "v1.19.4"
   mcp-gateway:
     description: "Install mcp-gateway (true/false)"
     required: false
@@ -25,16 +21,34 @@ inputs:
     required: false
     default: "v0.22.0"
   anthropic-api-key:
-    description: "Anthropic API key (defaults to ANTHROPIC_API_KEY secret)"
+    description: "Anthropic API key for Claude models (at least one API key required)"
     required: false
   openai-api-key:
-    description: "OpenAI API key (defaults to OPENAI_API_KEY secret)"
+    description: "OpenAI API key (at least one API key required)"
     required: false
   google-api-key:
-    description: "Google API key for Gemini (defaults to GOOGLE_API_KEY secret)"
+    description: "Google API key for Gemini models (at least one API key required)"
+    required: false
+  aws-bearer-token-bedrock:
+    description: "AWS Bearer token for Bedrock models (at least one API key required)"
+    required: false
+  xai-api-key:
+    description: "xAI API key for Grok models (at least one API key required)"
+    required: false
+  nebius-api-key:
+    description: "Nebius API key (at least one API key required)"
+    required: false
+  mistral-api-key:
+    description: "Mistral API key (at least one API key required)"
     required: false
   github-token:
-    description: "GitHub token for API access (defaults to GITHUB_TOKEN env var)"
+    description: "GitHub token for API access (defaults to github.token)"
+    required: false
+  github-app-id:
+    description: "GitHub App ID for custom identity (comments/reviews appear as the app)"
+    required: false
+  github-app-private-key:
+    description: "GitHub App private key (required if github-app-id is provided)"
     required: false
   timeout:
     description: "Timeout in seconds for agent execution (0 for no timeout)"
@@ -52,14 +66,34 @@ inputs:
     description: "Enable yolo mode - auto-approve all prompts (true/false)"
     required: false
     default: "true"
+  max-retries:
+    description: "Maximum number of retries on failure (0 = no retries)"
+    required: false
+    default: "2"
+  retry-delay:
+    description: "Base delay in seconds between retries (doubles each attempt)"
+    required: false
+    default: "5"
   extra-args:
-    description: "Additional arguments to pass to cagent exec"
+    description: "Additional arguments to pass to cagent run"
     required: false
     default: ""
+  trusted-bot-app-id:
+    description: "GitHub App ID of a trusted bot that can bypass comment-based auth checks (e.g., for self-review triggers)"
+    required: false
+    default: ""
+  add-prompt-files:
+    description: "Comma-separated list of files to append to the prompt (e.g., 'AGENTS.md,CLAUDE.md')"
+    required: false
+    default: ""
+  skip-summary:
+    description: "Skip writing agent output to the job summary (useful when callers write their own summary)"
+    required: false
+    default: "false"
 
 outputs:
   exit-code:
-    description: "Exit code from cagent exec"
+    description: "Exit code from cagent run"
     value: ${{ steps.run-agent.outputs.exit-code }}
   output-file:
     description: "Path to the output log file"
@@ -73,15 +107,18 @@ outputs:
   execution-time:
     description: "Agent execution time in seconds"
     value: ${{ steps.run-agent.outputs.execution-time }}
+  verbose-log-file:
+    description: "Path to the full verbose agent log (includes tool calls)"
+    value: ${{ steps.run-agent.outputs.verbose-log-file }}
   security-blocked:
-    description: "Whether execution was blocked due to security concerns"
-    value: ${{ steps.sanitize-input.outputs.blocked == 'true' || steps.sanitize-output.outputs.leaked == 'true' }}
+    description: "Whether execution was blocked due to security concerns (true/false)"
+    value: ${{ (steps.sanitize-input.outputs.blocked == 'true' || steps.sanitize-output.outputs.leaked == 'true') && 'true' || 'false' }}
   secrets-detected:
     description: "Whether secrets were detected in output"
     value: ${{ steps.sanitize-output.outputs.leaked }}
   prompt-suspicious:
-    description: "Whether suspicious patterns were detected in user prompt"
-    value: ${{ steps.sanitize-prompt.outputs.suspicious }}
+    description: "Whether suspicious content was stripped from the prompt (true/false)"
+    value: ${{ steps.sanitize-input.outputs.stripped }}
   input-risk-level:
     description: "Risk level of input (low/medium/high)"
     value: ${{ steps.sanitize-input.outputs.risk-level }}
@@ -89,17 +126,31 @@ outputs:
 runs:
   using: "composite"
   steps:
+    # Single source of truth: reads cagent binary version from CAGENT_VERSION file.
+    - name: Set cagent version
+      id: cagent-version
+      shell: bash
+      run: echo "value=$(cat "${{ github.action_path }}/CAGENT_VERSION" | tr -d '[:space:]')" >> $GITHUB_OUTPUT
+
     - name: Validate inputs
       id: validate-inputs
       shell: bash
       env:
         AGENT: ${{ inputs.agent }}
-        CAGENT_VERSION: ${{ inputs.cagent-version }}
+        CAGENT_VERSION: ${{ steps.cagent-version.outputs.value }}
         MCP_GATEWAY: ${{ inputs.mcp-gateway }}
         MCP_GATEWAY_VERSION: ${{ inputs.mcp-gateway-version }}
         DEBUG: ${{ inputs.debug }}
         YOLO: ${{ inputs.yolo }}
         EXTRA_ARGS: ${{ inputs.extra-args }}
+        # API keys (explicit inputs only - no env var fallback)
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        GOOGLE_API_KEY: ${{ inputs.google-api-key }}
+        AWS_BEARER_TOKEN_BEDROCK: ${{ inputs.aws-bearer-token-bedrock }}
+        XAI_API_KEY: ${{ inputs.xai-api-key }}
+        NEBIUS_API_KEY: ${{ inputs.nebius-api-key }}
+        MISTRAL_API_KEY: ${{ inputs.mistral-api-key }}
       run: |
         # Validate agent is provided
         if [[ -z "$AGENT" ]]; then
@@ -121,6 +172,14 @@ runs:
           fi
         fi
 
+        # Validate at least one API key is provided (explicit input required)
+        if [[ -z "$ANTHROPIC_API_KEY" && -z "$OPENAI_API_KEY" && -z "$GOOGLE_API_KEY" && \
+              -z "$AWS_BEARER_TOKEN_BEDROCK" && -z "$XAI_API_KEY" && -z "$NEBIUS_API_KEY" && \
+              -z "$MISTRAL_API_KEY" ]]; then
+          echo "::error::At least one API key is required. Provide one of: anthropic-api-key, openai-api-key, google-api-key, aws-bearer-token-bedrock, xai-api-key, nebius-api-key, or mistral-api-key"
+          exit 1
+        fi
+
         if [[ "$DEBUG" == "true" ]]; then
           echo "::debug::Validation passed"
           echo "::debug::agent: $AGENT"
@@ -128,6 +187,84 @@ runs:
           echo "::debug::mcp-gateway version: $MCP_GATEWAY_VERSION"
           echo "::debug::mcp-gateway install: $MCP_GATEWAY"
         fi
+
+    # ========================================
+    # SECURITY: Authorization Check
+    # Only enforced for comment-triggered events (the main abuse vector)
+    # PR-triggered workflows are controlled by the workflow author
+    # ========================================
+    - name: Check authorization
+      id: check-auth
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        TRUSTED_BOT_APP_ID: ${{ inputs.trusted-bot-app-id }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        # Read comment fields directly from the event payload (cannot be overridden by workflow env vars)
+        COMMENT_ASSOCIATION=$(jq -r '.comment.author_association // empty' "$GITHUB_EVENT_PATH")
+
+        # Only enforce auth for comment-triggered events
+        # This prevents abuse via /commands while allowing PR-triggered workflows to run
+        if [ -z "$COMMENT_ASSOCIATION" ]; then
+          echo "ℹ️ Skipping auth check (not a comment-triggered event)"
+          echo "authorized=skipped" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Allow a trusted GitHub App bot to bypass auth (e.g., auto-triage posts /review).
+        # Verified via user type + app ID from the event payload to prevent spoofing.
+        if [ -n "$TRUSTED_BOT_APP_ID" ]; then
+          COMMENT_USER_TYPE=$(jq -r '.comment.user.type // empty' "$GITHUB_EVENT_PATH")
+          COMMENT_APP_ID=$(jq -r '.comment.performed_via_github_app.id // empty' "$GITHUB_EVENT_PATH")
+
+          if [ "$COMMENT_USER_TYPE" = "Bot" ] && [ -n "$COMMENT_APP_ID" ] && [ "$COMMENT_APP_ID" = "$TRUSTED_BOT_APP_ID" ]; then
+            COMMENT_USER_LOGIN=$(jq -r '.comment.user.login // empty' "$GITHUB_EVENT_PATH")
+            echo "ℹ️ Skipping auth check (trusted bot: $COMMENT_USER_LOGIN, app_id: $COMMENT_APP_ID)"
+            echo "authorized=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+        fi
+
+        echo "Using comment author_association: $COMMENT_ASSOCIATION"
+
+        # Allowed roles (hardcoded for security - cannot be overridden)
+        ALLOWED_ROLES='["OWNER", "MEMBER", "COLLABORATOR"]'
+
+        # Run the authorization check
+        $ACTION_PATH/security/check-auth.sh "$COMMENT_ASSOCIATION" "$ALLOWED_ROLES"
+
+    # ========================================
+    # GitHub App Token (Optional)
+    # ========================================
+
+    # Generate token if GitHub App credentials are provided
+    - name: Generate GitHub App token
+      id: app-token
+      if: inputs.github-app-id != ''
+      uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2
+      with:
+        app_id: ${{ inputs.github-app-id }}
+        private_key: ${{ inputs.github-app-private-key }}
+
+    - name: Resolve GitHub token
+      id: resolve-token
+      shell: bash
+      run: |
+        if [ -n "$APP_TOKEN" ]; then
+          echo "✅ Using GitHub App token"
+          echo "token=$APP_TOKEN" >> $GITHUB_OUTPUT
+        elif [ -n "$EXPLICIT_TOKEN" ]; then
+          echo "✅ Using provided github-token"
+          echo "token=$EXPLICIT_TOKEN" >> $GITHUB_OUTPUT
+        else
+          echo "ℹ️ Using default github.token"
+          echo "token=$DEFAULT_TOKEN" >> $GITHUB_OUTPUT
+        fi
+      env:
+        APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        EXPLICIT_TOKEN: ${{ inputs.github-token }}
+        DEFAULT_TOKEN: ${{ github.token }}
 
     # ========================================
     # SECURITY: Sanitize and Analyze Input
@@ -152,7 +289,7 @@ runs:
       uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
       with:
         path: ${{ github.workspace }}/cagent
-        key: cagent-${{ runner.os }}-${{ inputs.cagent-version }}
+        key: cagent-${{ runner.os }}-${{ steps.cagent-version.outputs.value }}
 
     - name: Cache mcp-gateway binary
       id: cache-mcp
@@ -166,7 +303,7 @@ runs:
       id: setup-binaries
       shell: bash
       env:
-        CAGENT_VERSION: ${{ inputs.cagent-version }}
+        CAGENT_VERSION: ${{ steps.cagent-version.outputs.value }}
         MCP_GATEWAY: ${{ inputs.mcp-gateway }}
         MCP_GATEWAY_VERSION: ${{ inputs.mcp-gateway-version }}
         DEBUG: ${{ inputs.debug }}
@@ -248,7 +385,7 @@ runs:
         if [[ "$CAGENT_CACHE_HIT" != "true" ]]; then
           echo "Downloading cagent $CAGENT_VERSION for $PLATFORM-$ARCH_NAME..."
           retry_download \
-            "https://github.com/docker/cagent/releases/download/$CAGENT_VERSION/$CAGENT_BINARY" \
+            "https://github.com/docker/docker-agent/releases/download/$CAGENT_VERSION/$CAGENT_BINARY" \
             "$GITHUB_WORKSPACE/cagent"
           chmod +x "$GITHUB_WORKSPACE/cagent"
         else
@@ -298,14 +435,18 @@ runs:
         echo "cagent-version=$CAGENT_VERSION" >> $GITHUB_OUTPUT
         echo "mcp-installed=$MCP_INSTALLED" >> $GITHUB_OUTPUT
 
-    - name: Run CAgent
+    - name: Run cagent
       id: run-agent
       shell: bash
       env:
-        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key || env.ANTHROPIC_API_KEY }}
-        OPENAI_API_KEY: ${{ inputs.openai-api-key || env.OPENAI_API_KEY }}
-        GOOGLE_API_KEY: ${{ inputs.google-api-key || env.GOOGLE_API_KEY }}
-        GH_TOKEN: ${{ inputs.github-token || github.token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        GOOGLE_API_KEY: ${{ inputs.google-api-key }}
+        AWS_BEARER_TOKEN_BEDROCK: ${{ inputs.aws-bearer-token-bedrock }}
+        XAI_API_KEY: ${{ inputs.xai-api-key }}
+        NEBIUS_API_KEY: ${{ inputs.nebius-api-key }}
+        MISTRAL_API_KEY: ${{ inputs.mistral-api-key }}
+        GH_TOKEN: ${{ steps.resolve-token.outputs.token }}
         AGENT: ${{ inputs.agent }}
         PROMPT_INPUT: ${{ inputs.prompt }}
         ACTION_PATH: ${{ github.action_path }}
@@ -314,10 +455,24 @@ runs:
         EXTRA_ARGS: ${{ inputs.extra-args }}
         TIMEOUT: ${{ inputs.timeout }}
         WORKING_DIR: ${{ inputs.working-directory }}
-        CAGENT_VERSION: ${{ inputs.cagent-version }}
+        CAGENT_VERSION: ${{ steps.cagent-version.outputs.value }}
         MCP_INSTALLED: ${{ steps.setup-binaries.outputs.mcp-installed }}
+        ADD_PROMPT_FILES: ${{ inputs.add-prompt-files }}
+        MAX_RETRIES: ${{ inputs.max-retries }}
+        RETRY_DELAY: ${{ inputs.retry-delay }}
+        TELEMETRY_TAGS: "source=github-actions,repo=${{ github.repository }},workflow=${{ github.workflow }},run_id=${{ github.run_id }}"
       run: |
         set -e
+
+        # Mask all API keys to prevent accidental exposure in logs
+        [ -n "$ANTHROPIC_API_KEY" ] && echo "::add-mask::$ANTHROPIC_API_KEY"
+        [ -n "$OPENAI_API_KEY" ] && echo "::add-mask::$OPENAI_API_KEY"
+        [ -n "$GOOGLE_API_KEY" ] && echo "::add-mask::$GOOGLE_API_KEY"
+        [ -n "$AWS_BEARER_TOKEN_BEDROCK" ] && echo "::add-mask::$AWS_BEARER_TOKEN_BEDROCK"
+        [ -n "$XAI_API_KEY" ] && echo "::add-mask::$XAI_API_KEY"
+        [ -n "$NEBIUS_API_KEY" ] && echo "::add-mask::$NEBIUS_API_KEY"
+        [ -n "$MISTRAL_API_KEY" ] && echo "::add-mask::$MISTRAL_API_KEY"
+        [ -n "$GH_TOKEN" ] && echo "::add-mask::$GH_TOKEN"
 
         # Change to working directory
         cd "$WORKING_DIR"
@@ -330,17 +485,35 @@ runs:
 
         # Create output file early (before any validation exits)
         # This ensures downstream steps always have a valid output file reference
-        OUTPUT_FILE=$(mktemp /tmp/cagent-output.XXXXXX.log)
+        OUTPUT_FILE=$(mktemp /tmp/cagent-output-XXXXXX)
+        if [ -z "$OUTPUT_FILE" ] || [ ! -f "$OUTPUT_FILE" ]; then
+          echo "::error::Failed to create output file"
+          exit 1
+        fi
         echo "output-file=$OUTPUT_FILE" >> $GITHUB_OUTPUT
         echo "Output file: $OUTPUT_FILE"
 
+        VERBOSE_LOG_FILE=$(mktemp /tmp/cagent-verbose-XXXXXX)
+        if [ -z "$VERBOSE_LOG_FILE" ] || [ ! -f "$VERBOSE_LOG_FILE" ]; then
+          echo "::error::Failed to create verbose log file"
+          exit 1
+        fi
+        echo "verbose-log-file=$VERBOSE_LOG_FILE" >> $GITHUB_OUTPUT
+        echo "Verbose log file: $VERBOSE_LOG_FILE"
+        VERBOSE_LOG_BASENAME=$(basename "$VERBOSE_LOG_FILE")
+        echo "verbose-log-artifact-name=cagent-verbose-log-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}-${VERBOSE_LOG_BASENAME}" >> $GITHUB_OUTPUT
+
         # Build command arguments array (SECURE: no eval!)
-        ARGS=("exec")
+        ARGS=("run" "--exec")
 
         # Add flags
         if [ "$YOLO" = "true" ]; then
           ARGS+=("--yolo")
         fi
+
+        # Set working directory so relative paths (e.g., memory toolset) resolve
+        # from the repo root, not from the agent YAML's parent directory
+        ARGS+=("--working-dir" "$(pwd)")
 
         # Add extra args if provided
         # Note: This uses simple word splitting. Quoted arguments with spaces are not supported.
@@ -350,43 +523,123 @@ runs:
           ARGS+=("${EXTRA_ARGS_ARRAY[@]}")
         fi
 
+        # Add prompt files as --prompt-file flags (cagent handles file resolution)
+        if [ -n "$ADD_PROMPT_FILES" ]; then
+          echo "Adding prompt files: $ADD_PROMPT_FILES"
+          IFS=',' read -ra FILES <<< "$ADD_PROMPT_FILES"
+          for file in "${FILES[@]}"; do
+            file=$(echo "$file" | xargs)  # trim whitespace
+            ARGS+=("--prompt-file" "$file")
+          done
+        fi
+
         # Add agent
         echo "Using agent: $AGENT"
         ARGS+=("$AGENT")
 
-        # Add prompt if provided (pass via stdin to avoid "Argument list too long" errors)
+        # Always pass prompt via stdin to satisfy cagent run's required prompt arg
+        ARGS+=("-")
         if [ -n "$PROMPT_INPUT" ]; then
-          ARGS+=("-")
           echo "Running cagent with ${#ARGS[@]} arguments (prompt via stdin)"
         else
-          echo "Running cagent with ${#ARGS[@]} arguments (no prompt)"
+          echo "Running cagent with ${#ARGS[@]} arguments (empty prompt via stdin)"
         fi
 
         # Track execution time
         START_TIME=$(date +%s)
 
-        # SECURE: Direct execution with quoted arguments (no eval!)
-        set +e  # Don't exit on command failure
-        if [ "$TIMEOUT" != "0" ]; then
-          if [ -n "$PROMPT_INPUT" ]; then
-            printf '%s\n' "$PROMPT_INPUT" | timeout "$TIMEOUT" "$GITHUB_WORKSPACE/cagent" "${ARGS[@]}" 2>&1 | tee "$OUTPUT_FILE"
-          else
-            timeout "$TIMEOUT" "$GITHUB_WORKSPACE/cagent" "${ARGS[@]}" 2>&1 | tee "$OUTPUT_FILE"
+        # Retry loop with exponential backoff
+        ATTEMPT=0
+        CURRENT_DELAY="$RETRY_DELAY"
+        EXIT_CODE=1
+
+        while true; do
+          ATTEMPT=$((ATTEMPT + 1))
+
+          if [ "$ATTEMPT" -gt 1 ]; then
+            echo "🔄 Retry attempt $((ATTEMPT - 1)) of $MAX_RETRIES (waiting ${CURRENT_DELAY}s)..."
+            sleep "$CURRENT_DELAY"
+            CURRENT_DELAY=$((CURRENT_DELAY * 2))
+            # Reset clean output file; append a separator to verbose log to preserve earlier attempts
+            > "$OUTPUT_FILE"
+            echo "" >> "$VERBOSE_LOG_FILE"
+            echo "========== RETRY ATTEMPT $ATTEMPT ($(date -u +%Y-%m-%dT%H:%M:%SZ)) ==========" >> "$VERBOSE_LOG_FILE"
+            echo "" >> "$VERBOSE_LOG_FILE"
           fi
-          EXIT_CODE=$?
+
+          # SECURE: Direct execution with quoted arguments (no eval!)
+          # Output goes to verbose log file only (keeps console clean)
+          # Prefer sanitized prompt file (comments stripped, suspicious lines removed)
+          # over raw $PROMPT_INPUT to enforce input sanitization.
+          # PIPESTATUS: [0]=cat/printf  [1]=cagent/timeout
+          PROMPT_FILE="/tmp/prompt-clean.txt"
+          set +e  # Don't exit on command failure
+          if [ "$TIMEOUT" != "0" ]; then
+            if [ -f "$PROMPT_FILE" ]; then
+              cat "$PROMPT_FILE" | timeout "$TIMEOUT" "$GITHUB_WORKSPACE/cagent" "${ARGS[@]}" >> "$VERBOSE_LOG_FILE" 2>&1
+            else
+              printf '%s\n' "$PROMPT_INPUT" | timeout "$TIMEOUT" "$GITHUB_WORKSPACE/cagent" "${ARGS[@]}" >> "$VERBOSE_LOG_FILE" 2>&1
+            fi
+            EXIT_CODE=${PIPESTATUS[1]}
+            if [ $EXIT_CODE -eq 124 ]; then
+              echo "::error::Agent execution timed out after $TIMEOUT seconds"
+            fi
+          else
+            if [ -f "$PROMPT_FILE" ]; then
+              cat "$PROMPT_FILE" | "$GITHUB_WORKSPACE/cagent" "${ARGS[@]}" >> "$VERBOSE_LOG_FILE" 2>&1
+            else
+              printf '%s\n' "$PROMPT_INPUT" | "$GITHUB_WORKSPACE/cagent" "${ARGS[@]}" >> "$VERBOSE_LOG_FILE" 2>&1
+            fi
+            EXIT_CODE=${PIPESTATUS[1]}
+          fi
+          set -e
+
+          # Success — no retry needed
+          if [ $EXIT_CODE -eq 0 ]; then
+            break
+          fi
+
+          # Timeout (124) — don't retry, would just timeout again
           if [ $EXIT_CODE -eq 124 ]; then
-            echo "::error::Agent execution timed out after $TIMEOUT seconds"
+            break
           fi
-        else
-          if [ -n "$PROMPT_INPUT" ]; then
-            printf '%s\n' "$PROMPT_INPUT" | "$GITHUB_WORKSPACE/cagent" "${ARGS[@]}" 2>&1 | tee "$OUTPUT_FILE"
-            EXIT_CODE=${PIPESTATUS[0]}
-          else
-            "$GITHUB_WORKSPACE/cagent" "${ARGS[@]}" 2>&1 | tee "$OUTPUT_FILE"
-            EXIT_CODE=$?
+
+          # Max retries exhausted
+          if [ "$ATTEMPT" -gt "$MAX_RETRIES" ]; then
+            echo "::warning::Agent failed after $MAX_RETRIES retries (exit code: $EXIT_CODE)"
+            break
           fi
-        fi
-        set -e
+
+          echo "::warning::Agent failed (exit code: $EXIT_CODE), will retry..."
+        done
+
+        # Produce clean output (strip tool calls/results) for downstream steps
+        awk '
+          /<thinking>/,/<\/thinking>/ { next }
+          /^\[thinking\]/,/^\[\/thinking\]/ { next }
+          /^Thinking:/ { next }
+          /^--- Tool:/ { in_tool=1; next }
+          in_tool && /^--- (Tool:|Agent:|$)/ { in_tool=0; next }
+          in_tool { next }
+          /^Calling [a-zA-Z_]+\(/ { in_call=1; next }
+          in_call && /^\)$/ { in_call=0; next }
+          in_call { next }
+          /^[a-zA-Z_]+ response →/ { in_resp=1; next }
+          in_resp && /^\)$/ { in_resp=0; next }
+          in_resp { next }
+          /^--- Agent:/ { next }
+          /^time=/ { next }
+          /^level=/ { next }
+          /^msg=/ { next }
+          /^> \[!NOTE\]/ { next }
+          /For any feedback/ { next }
+          /transfer_task/ { next }
+          /Delegating to/ { next }
+          /Task delegated/ { next }
+          NF==0 && !seen_content { next }
+          NF>0 { seen_content=1 }
+          { print }
+        ' "$VERBOSE_LOG_FILE" > "$OUTPUT_FILE"
 
         END_TIME=$(date +%s)
         EXECUTION_TIME=$((END_TIME - START_TIME))
@@ -395,16 +648,17 @@ runs:
         echo "exit-code=$EXIT_CODE" >> $GITHUB_OUTPUT
         echo "execution-time=$EXECUTION_TIME" >> $GITHUB_OUTPUT
 
-        # Create job summary
+        # Create job summary (skipped when caller handles its own summary)
+        if [[ "${{ inputs.skip-summary }}" != "true" ]]; then
         {
-          echo "## CAgent Execution Summary"
+          echo "## cagent Execution Summary"
           echo ""
           echo "| Property | Value |"
           echo "|----------|-------|"
           echo "| Agent | \`$AGENT\` |"
           echo "| Exit Code | $EXIT_CODE |"
           echo "| Execution Time | ${EXECUTION_TIME}s |"
-          echo "| CAgent Version | $CAGENT_VERSION |"
+          echo "| cagent Version | $CAGENT_VERSION |"
           echo "| MCP Gateway | $MCP_INSTALLED |"
           if [ "$TIMEOUT" != "0" ]; then
             echo "| Timeout | ${TIMEOUT}s |"
@@ -419,6 +673,7 @@ runs:
             echo "❌ **Status:** Failed"
           fi
         } >> $GITHUB_STEP_SUMMARY
+        fi
 
         if [[ "$DEBUG" == "true" ]]; then
           echo "::debug::Exit code: $EXIT_CODE"
@@ -451,69 +706,36 @@ runs:
 
         $ACTION_PATH/security/sanitize-output.sh "$OUTPUT_FILE"
 
-        # Extract clean output (remove verbose cagent logging, timestamps, agent markers)
-        echo "🧹 Extracting clean agent output..."
-
-        # Primary method: Extract from cagent-output code block (most reliable)
-        if grep -q '^```cagent-output' "$OUTPUT_FILE"; then
-          # Extract everything between ```cagent-output and the closing ```
-          # Using awk to handle multi-line content properly
-          awk '/^```cagent-output$/,/^```$/ {
-            if (!/^```cagent-output$/ && !/^```$/) print
-          }' "$OUTPUT_FILE" > "${OUTPUT_FILE}.clean"
-
-          echo "✅ Extracted clean output from cagent-output code block"
-
-        # Fallback: Extract after agent marker
-        elif grep -q "^--- Agent: root ---$" "$OUTPUT_FILE"; then
-          AGENT_LINE=$(grep -n "^--- Agent: root ---$" "$OUTPUT_FILE" | tail -1 | cut -d: -f1)
-
-          # Validate AGENT_LINE is not empty before using it in arithmetic expansion
-          if [ -n "$AGENT_LINE" ]; then
-            tail -n +$((AGENT_LINE + 1)) "$OUTPUT_FILE" | \
-              grep -v "^time=" | \
-              grep -v "^level=" | \
-              grep -v "^msg=" | \
-              grep -v "^--- Agent:" | \
-              grep -v "^--- Tool:" | \
-              grep -v "^<thinking>" | \
-              grep -v "^</thinking>" | \
-              grep -v "^\[thinking\]" | \
-              grep -v "^\[/thinking\]" | \
-              grep -v "^Thinking:" | \
-              grep -v "^> \[!NOTE\]" | \
-              grep -v "For any feedback" | \
-              sed '/^$/N;/^\n$/d' > "${OUTPUT_FILE}.clean"
-
-            echo "⚠️  No cagent-output block found, extracted after agent marker"
+        # Extract from cagent-output code block if present (overrides awk-filtered output)
+        # Note: the code fence may not be at the start of a line if the agent
+        # emits conversational text before it, so we avoid anchoring with ^.
+        if grep -q '```cagent-output' "$OUTPUT_FILE"; then
+          echo "🧹 Extracting clean output from cagent-output code block..."
+          awk '
+            /```cagent-output/ { capturing=1; next }
+            capturing && /```/ { capturing=0; next }
+            capturing { print }
+          ' "$OUTPUT_FILE" > "${OUTPUT_FILE}.clean"
+          if [ -s "${OUTPUT_FILE}.clean" ]; then
+            mv "${OUTPUT_FILE}.clean" "$OUTPUT_FILE"
+            echo "✅ Extracted clean output from cagent-output code block"
           else
-            echo "⚠️  Failed to extract line number from agent marker"
-            cp "$OUTPUT_FILE" "${OUTPUT_FILE}.clean"
+            echo "::warning::Extracted cagent-output code block is empty, keeping filtered output"
+            rm -f "${OUTPUT_FILE}.clean"
           fi
-
-        # Fallback: Just clean metadata
-        else
-          grep -v "^time=" "$OUTPUT_FILE" | \
-            grep -v "^level=" | \
-            grep -v "^msg=" | \
-            grep -v "^--- Agent:" | \
-            grep -v "^--- Tool:" | \
-            grep -v "^<thinking>" | \
-            grep -v "^</thinking>" | \
-            grep -v "^\[thinking\]" | \
-            grep -v "^\[/thinking\]" | \
-            grep -v "^Thinking:" | \
-            grep -v "^> \[!NOTE\]" | \
-            grep -v "For any feedback" > "${OUTPUT_FILE}.clean"
-
-          echo "⚠️  No extraction markers found - cleaned metadata only"
         fi
 
-        # Use the cleaned output
-        mv "${OUTPUT_FILE}.clean" "$OUTPUT_FILE"
+    - name: Upload verbose agent log
+      if: always() && steps.run-agent.outputs.verbose-log-file != ''
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ steps.run-agent.outputs.verbose-log-artifact-name }}
+        path: ${{ steps.run-agent.outputs.verbose-log-file }}
+        retention-days: 14
+        if-no-files-found: ignore
 
     - name: Update job summary with cleaned output
-      if: always()
+      if: always() && inputs.skip-summary != 'true'
       shell: bash
       env:
         OUTPUT_FILE: ${{ steps.run-agent.outputs.output-file }}
@@ -544,7 +766,7 @@ runs:
       if: steps.sanitize-output.outputs.leaked == 'true'
       shell: bash
       env:
-        GH_TOKEN: ${{ inputs.github-token || github.token }}
+        GH_TOKEN: ${{ steps.resolve-token.outputs.token }}
         REPOSITORY: ${{ github.repository }}
         RUN_ID: ${{ github.run_id }}
       run: |
@@ -580,6 +802,10 @@ runs:
           - GITHUB_TOKEN
           - OPENAI_API_KEY
           - GOOGLE_API_KEY
+          - AWS_BEARER_TOKEN_BEDROCK
+          - XAI_API_KEY
+          - NEBIUS_API_KEY
+          - MISTRAL_API_KEY
           - Any other exposed credentials
         3. Investigate the workflow trigger and input prompt
         4. Review workflow run history for suspicious patterns

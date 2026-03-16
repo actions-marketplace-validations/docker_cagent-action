@@ -1,34 +1,440 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: "Version bump type"
+        required: true
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+concurrency:
+  group: release
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
-  update-latest-tag:
-    name: Update latest tag
+  release:
+    name: Create release
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.release-commit.outputs.sha }}
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
 
-      - name: Update latest tag
+      - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Delete the existing latest tag if it exists (both locally and remotely)
+      - name: Calculate new version
+        id: version
+        env:
+          BUMP_TYPE: ${{ inputs.version_bump }}
+        run: |
+          # Get the latest semver tag
+          LATEST_TAG=$(git tag -l 'v*.*.*' --sort=-v:refname | head -n1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No existing version tags found, starting at v0.0.0"
+            MAJOR=0; MINOR=0; PATCH=0
+          else
+            VERSION="${LATEST_TAG#v}"
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+            echo "Current version: v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          # Bump the chosen segment
+          case "$BUMP_TYPE" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+
+          # Collision avoidance: if tag already exists, bump patch until unique
+          while git rev-parse "$NEW_VERSION" >/dev/null 2>&1; do
+            echo "Tag $NEW_VERSION already exists, bumping patch..."
+            PATCH=$((PATCH + 1))
+            NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          done
+
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "previous=${LATEST_TAG}" >> $GITHUB_OUTPUT
+          echo "New version: $NEW_VERSION (previous: ${LATEST_TAG:-none})"
+
+      # CI cannot push commits to main (branch protection). Instead, we create
+      # a detached release commit with pinned refs, reachable only via tags.
+      # main keeps @latest refs for development; tagged commits are self-contained.
+      - name: Create release commit with pinned refs
+        id: release-commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          echo "Pinning @latest refs to ${VERSION}..."
+
+          # Pin all docker/cagent-action*@latest refs -> @vX.Y.Z
+          # Uses a capture group so any sub-path (e.g., /review-pr, /review-pr/reply) is preserved.
+          # Automatically covers new sub-actions without needing to update this workflow.
+          # Only targets `uses:` lines to avoid pinning refs in comments or documentation.
+          PIN_PATTERN='s|^\([^#]*uses: *docker/cagent-action\)\([^@]*\)@latest|\1\2@'"${VERSION}"'|g'
+          PINNED_FILES=()
+          while IFS= read -r file; do
+            sed -i "$PIN_PATTERN" "$file"
+            PINNED_FILES+=("$file")
+            echo "  Pinned: $file"
+          done < <(grep -rl 'uses: *docker/cagent-action[^@]*@latest' --include='*.yml' --include='*.yaml' \
+            --exclude-dir=.git \
+            review-pr/ .github/workflows/review-pr.yml)
+
+          if [ ${#PINNED_FILES[@]} -eq 0 ]; then
+            echo "::error::No @latest refs found to pin — expected at least one. Check that review-pr/ actions still reference @latest."
+            exit 1
+          fi
+
+          # Verify no @latest uses: refs remain in pinned files
+          REMAINING=$(grep -n '^[^#]*uses: *docker/cagent-action[^@]*@latest' "${PINNED_FILES[@]}" 2>/dev/null || true)
+          if [ -n "$REMAINING" ]; then
+            echo "::error::Unpinned @latest refs remain after release:"
+            echo "$REMAINING"
+            exit 1
+          fi
+
+          echo "Pinned refs:"
+          grep -rn "cagent-action@" "${PINNED_FILES[@]}"
+
+          # Create a detached commit (not on main) with the pinned refs
+          # Note: write-tree captures the full index (all files from HEAD),
+          # but we explicitly add CAGENT_VERSION for clarity.
+          git add "${PINNED_FILES[@]}" CAGENT_VERSION
+          TREE=$(git write-tree)
+          RELEASE_SHA=$(git commit-tree "$TREE" -p HEAD -m "release: ${VERSION}")
+
+          echo "sha=$RELEASE_SHA" >> $GITHUB_OUTPUT
+          echo "Release commit: $RELEASE_SHA"
+
+      - name: Push version tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_SHA: ${{ steps.release-commit.outputs.sha }}
+        run: |
+          git tag "$VERSION" "$RELEASE_SHA"
+          git push origin "$VERSION"
+
+      - name: Create GitHub Release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PREVIOUS: ${{ steps.version.outputs.previous }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          ARGS=(--generate-notes --latest)
+          if [ -n "$PREVIOUS" ]; then
+            ARGS+=(--notes-start-tag "$PREVIOUS")
+          fi
+          gh release create "$VERSION" "${ARGS[@]}"
+
+      - name: Update latest tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_SHA: ${{ steps.release-commit.outputs.sha }}
+        run: |
+          # Delete existing latest tag (local + remote)
           git tag -d latest 2>/dev/null || true
           git push origin :refs/tags/latest 2>/dev/null || true
 
-          # Create new latest tag pointing to the current commit
-          git tag latest
+          # Create new latest tag pointing to the release commit
+          git tag latest "$RELEASE_SHA"
           git push origin latest
 
-          echo "✅ Updated 'latest' tag to point to ${{ github.ref_name }}"
+          echo "Updated 'latest' tag to point to ${VERSION} ($RELEASE_SHA)"
+
+  update-pinata:
+    name: Update pinata pr-review workflow
+    needs: release
+    if: success()
+    runs-on: ubuntu-latest
+    concurrency:
+      group: update-pinata
+      cancel-in-progress: false
+    steps:
+      - name: Checkout pinata
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: docker/pinata
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Update cagent-action reference
+        id: update
+        env:
+          SHA: ${{ needs.release.outputs.sha }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          FILE=".github/workflows/pr-review.yml"
+          if [ ! -f "$FILE" ]; then
+            echo "::error::$FILE not found in pinata"
+            exit 1
+          fi
+
+          if [ -z "$SHA" ] || [ -z "$VERSION" ]; then
+            echo "::error::SHA or VERSION is empty (SHA='$SHA', VERSION='$VERSION')"
+            exit 1
+          fi
+
+          PATTERN='cagent-action/\.github/workflows/review-pr\.yml@[[:xdigit:]]\{40\} # v[0-9.]*'
+          if ! grep -q "$PATTERN" "$FILE"; then
+            echo "::error::Expected cagent-action reference pattern not found in $FILE — format may have changed"
+            exit 1
+          fi
+
+          sed -i "s|${PATTERN}|cagent-action/.github/workflows/review-pr.yml@${SHA} # ${VERSION}|" "$FILE"
+
+          if git diff --quiet "$FILE"; then
+            echo "File already up to date, skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Updated reference to ${SHA} # ${VERSION}"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update PR
+        if: steps.update.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA: ${{ needs.release.outputs.sha }}
+        run: |
+          BRANCH="auto/update-cagent-action"
+          RELEASE_URL="https://github.com/docker/cagent-action/releases/tag/$VERSION"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -B "$BRANCH"
+          git add .github/workflows/pr-review.yml
+          git commit -m "chore: update cagent-action to $VERSION"
+
+          # Force-push to handle both new and existing branches.
+          # This branch is exclusively managed by this workflow, so --force is safe.
+          git push --force origin "$BRANCH"
+
+          EXISTING_PR=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+
+          PR_BODY="$(cat <<EOF
+          ## Summary
+          Updates \`cagent-action\` reference in \`pr-review.yml\` to [$VERSION]($RELEASE_URL).
+          - **Commit**: \`${SHA}\`
+          - **Version**: \`${VERSION}\`
+          > Auto-generated by the [release](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow.
+
+          /skip-builds
+          /skip-tests
+          EOF
+          )"
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Updating existing PR #$EXISTING_PR"
+            gh pr edit "$EXISTING_PR" \
+              --title "chore: update cagent-action to $VERSION" \
+              --body "$PR_BODY" \
+              --add-reviewer "derekmisler"
+          else
+            echo "Creating new PR"
+            gh pr create \
+              --title "chore: update cagent-action to $VERSION" \
+              --body "$PR_BODY" \
+              --label "team/gordon" \
+              --label "merge/auto" \
+              --reviewer "derekmisler"
+          fi
+
+  publish-agent:
+    name: Push review-pr agent to Docker Hub
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.release.outputs.version }}
+
+      - name: Install cagent
+        run: |
+          set -e
+          CAGENT_VERSION=$(tr -d '[:space:]' < CAGENT_VERSION)
+          if [ -z "$CAGENT_VERSION" ]; then
+            echo "::error::Could not extract cagent version from CAGENT_VERSION"
+            exit 1
+          fi
+          echo "Using cagent version from CAGENT_VERSION: ${CAGENT_VERSION}"
+          curl -fL -o cagent \
+            "https://github.com/docker/docker-agent/releases/download/${CAGENT_VERSION}/cagent-linux-amd64"
+          chmod +x cagent
+          sudo mv cagent /usr/local/bin/
+
+      - name: Docker Hub login
+        env:
+          HUB_USER: ${{ secrets.HUB_USER }}
+          HUB_PAT: ${{ secrets.HUB_PAT }}
+        run: |
+          set -e
+          if [ -z "${HUB_USER}" ]; then echo "::error::HUB_USER secret is not set"; exit 1; fi
+          if [ -z "${HUB_PAT}" ]; then echo "::error::HUB_PAT secret is not set"; exit 1; fi
+          echo "${HUB_PAT}" | docker login --username "${HUB_USER}" --password-stdin
+
+      - name: Push agent
+        env:
+          HUB_ORG: ${{ secrets.HUB_ORG }}
+        run: |
+          set -e
+          if [ -z "${HUB_ORG}" ]; then echo "::error::HUB_ORG secret is not set"; exit 1; fi
+          cd review-pr/agents
+          TELEMETRY_ENABLED=false cagent share push pr-review.yaml "${HUB_ORG}/review-pr"
+
+      - name: Upload README to Docker Hub
+        env:
+          HUB_USER: ${{ secrets.HUB_USER }}
+          HUB_PAT: ${{ secrets.HUB_PAT }}
+          HUB_ORG: ${{ secrets.HUB_ORG }}
+        run: |
+          set -e
+          TOKEN=$(curl -sSf -X POST https://hub.docker.com/v2/users/login/ \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"${HUB_USER}\",\"password\":\"${HUB_PAT}\"}" | jq -r .token)
+          if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+            echo "::error::Failed to get Docker Hub API token"
+            exit 1
+          fi
+          curl -sSf -X PATCH "https://hub.docker.com/v2/namespaces/${HUB_ORG}/repositories/review-pr" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg desc "Docker Agent-powered PR review team. Analyzes code changes, posts reviews, and learns from feedback." \
+                       --rawfile readme review-pr/README.md \
+                       '{description: $desc, full_description: $readme}')"
+
+  notify:
+    name: Notify Slack
+    needs: [release, publish-agent]
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch release notes from GitHub
+        id: release-notes
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          if ! NOTES=$(gh release view "$VERSION" --repo docker/cagent-action --json body --jq '.body'); then
+            echo "::warning::Failed to fetch release notes, using fallback"
+            NOTES="Release ${VERSION} — see GitHub for details."
+          fi
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Generate Slack summary
+        id: slack-summary
+        # @latest resolves to the previous release here, not the one just created.
+        # This is fine — the release-notes agent doesn't change between versions.
+        # GitHub Actions requires static `uses:` values, so we can't pin dynamically.
+        uses: docker/cagent-action@latest
+        with:
+          agent: agentcatalog/github-action-release-notes
+          prompt: |
+            Convert these release notes to a SHORT plain text Slack message.
+
+            VERSION: ${{ needs.release.outputs.version }}
+            RELEASE URL: https://github.com/docker/cagent-action/releases/tag/${{ needs.release.outputs.version }}
+
+            ORIGINAL RELEASE NOTES:
+            ${{ steps.release-notes.outputs.notes }}
+
+            CRITICAL - PLAIN TEXT ONLY:
+            This goes through Slack Workflow Builder which does NOT support formatting.
+            - DO NOT use *asterisks* - they show literally
+            - DO NOT use <url|text> links - use plain URLs
+            - DO use :emoji: codes - those work
+            - DO use bullet points with •
+            - Use CAPS for section headers instead of bold
+
+            OUTPUT REQUIREMENTS:
+            - Keep it SHORT - max 5-7 bullet points total
+            - Include the release URL at the end (plain URL, not link syntax)
+            - Output ONLY the Slack message, nothing else
+            - Skip the "Platforms" line — this is a GitHub Action, not a binary
+
+            EXAMPLE FORMAT:
+            :tada: cagent-action v1.3.0 Released
+
+            :package: WHAT'S NEW
+            • New feature one
+            • New feature two
+
+            :wrench: IMPROVEMENTS
+            • Enhancement description
+
+            :bug: BUG FIXES
+            • Fix description
+
+            :inbox_tray: Release: https://github.com/docker/cagent-action/releases/tag/v1.3.0
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Send Slack notification
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_RELEASE_WEBHOOK }}
+          VERSION: ${{ needs.release.outputs.version }}
+          SLACK_SUMMARY_FILE: ${{ steps.slack-summary.outputs.output-file }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "⚠️ SLACK_RELEASE_WEBHOOK not configured, skipping notification"
+            exit 0
+          fi
+
+          RELEASE_URL="https://github.com/docker/cagent-action/releases/tag/${VERSION}"
+
+          # Use the AI-generated Slack summary
+          if [ -f "$SLACK_SUMMARY_FILE" ] && [ -s "$SLACK_SUMMARY_FILE" ]; then
+            MESSAGE_TEXT=$(cat "$SLACK_SUMMARY_FILE")
+          else
+            # Fallback message if summary generation failed
+            MESSAGE_TEXT=$(printf ':tada: cagent-action %s Released\n\n:package: See the full release notes for details.\n\n:inbox_tray: Release: %s' "$VERSION" "$RELEASE_URL")
+          fi
+
+          # Create payload with text and release_url fields (matching Slack Workflow Builder webhook)
+          PAYLOAD=$(jq -n \
+            --arg text "$MESSAGE_TEXT" \
+            --arg release_url "$RELEASE_URL" \
+            '{
+              text: $text,
+              release_url: $release_url
+            }')
+
+          if ! HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/slack_response.txt -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"); then
+            echo "⚠️ Slack notification failed (curl error)"
+          elif [ "$HTTP_CODE" -eq 200 ]; then
+            echo "✅ Slack notification sent"
+          else
+            echo "⚠️ Slack notification failed (HTTP $HTTP_CODE)"
+            cat /tmp/slack_response.txt
+          fi
+          # Don't fail the workflow if Slack fails

@@ -4,6 +4,8 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 echo "=========================================="
 echo "Testing Job Summary Format"
 echo "=========================================="
@@ -23,19 +25,19 @@ Scanned 15 commits from the past 2 days. No security vulnerabilities were identi
 EOF
 
 echo ""
-echo "Test 1: Creating initial summary (simulating Run CAgent step)"
+echo "Test 1: Creating initial summary (simulating Run cagent step)"
 echo "---"
 
 # Simulate initial summary creation
 {
-  echo "## CAgent Execution Summary"
+  echo "## cagent Execution Summary"
   echo ""
   echo "| Property | Value |"
   echo "|----------|-------|"
   echo "| Agent | \`agents/security-scanner.yaml\` |"
   echo "| Exit Code | 0 |"
   echo "| Execution Time | 45s |"
-  echo "| CAgent Version | v1.19.4 |"
+  echo "| cagent Version | $(cat "$SCRIPT_DIR/../CAGENT_VERSION" | tr -d '[:space:]') |"
   echo "| MCP Gateway | false |"
   echo ""
   echo "✅ **Status:** Success"
@@ -69,7 +71,7 @@ echo "Test 3: Verify structure"
 echo "---"
 
 # Verify the summary has the expected structure
-if grep -q "## CAgent Execution Summary" "$SUMMARY_FILE"; then
+if grep -q "## cagent Execution Summary" "$SUMMARY_FILE"; then
   echo "✅ Has execution summary table"
 else
   echo "❌ Missing execution summary table"
@@ -133,7 +135,7 @@ EOF
 # Create fresh summary
 SUMMARY_FILE2="$TEST_DIR/summary2.md"
 {
-  echo "## CAgent Execution Summary"
+  echo "## cagent Execution Summary"
   echo ""
   echo "✅ **Status:** Success"
   echo ""

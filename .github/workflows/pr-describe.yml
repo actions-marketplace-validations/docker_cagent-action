@@ -12,18 +12,54 @@ jobs:
     # Only run if comment contains /describe and is on a PR
     if: ${{ (github.event.issue.pull_request && contains(github.event.comment.body, '/describe')) }}
     runs-on: ubuntu-latest
+    env:
+      HAS_APP_SECRETS: ${{ secrets.CAGENT_REVIEWER_APP_ID != '' }}
     permissions:
       contents: read
       pull-requests: write
       issues: write
+      checks: write
     steps:
       - name: Check out Git repository
         uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+
+      - name: Create check run
+        id: create-check
+        continue-on-error: true # Don't fail if checks: write permission is missing
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const prNumber = context.issue.number;
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            const { data: check } = await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Generate PR Description',
+              head_sha: pr.head.sha,
+              status: 'in_progress',
+              started_at: new Date().toISOString()
+            });
+            core.setOutput('check-id', check.id);
+
+      # Generate GitHub App token so actions appear as the custom app (optional - falls back to github.token)
+      - name: Get GitHub App token
+        id: app-token
+        if: env.HAS_APP_SECRETS == 'true'
+        continue-on-error: true  # Don't fail workflow if token generation fails
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2
+        with:
+          app_id: ${{ secrets.CAGENT_REVIEWER_APP_ID }}
+          private_key: ${{ secrets.CAGENT_REVIEWER_APP_PRIVATE_KEY }}
 
       - name: Validate PR and add reaction
         id: validate_pr
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |
             const prNumber = context.issue.number;
             const commentId = context.payload.comment.id;
@@ -54,6 +90,7 @@ jobs:
         id: pr_details
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |
             const fs = require('fs');
             const prNumber = ${{ steps.validate_pr.outputs.pr_number }};
@@ -144,34 +181,72 @@ jobs:
             **Diff:**
             $(cat pr.diff)
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          timeout: 300000 # 5 minutes
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
+          timeout: 300 # 5 minutes
 
       - name: Update PR description
         if: ${{ steps.generate.conclusion == 'success' }}
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |
             const fs = require('fs');
             const prNumber = ${{ steps.validate_pr.outputs.pr_number }};
             const descriptionFile = '${{ steps.generate.outputs.output-file }}';
 
-            // Read generated description
-            const description = fs.readFileSync(descriptionFile, 'utf8');
+            try {
+              // Read generated description and extract cagent-output block if present.
+              // The composite action should already clean this, but the agent may
+              // emit conversational text before the code fence that slips through.
+              const raw = fs.readFileSync(descriptionFile, 'utf8');
+              const fenceMatch = raw.match(/```cagent-output[\s\S]*?\n([\s\S]*?)```/);
+              let description;
+              if (fenceMatch) {
+                description = fenceMatch[1].trim();
+              } else {
+                // Fallback: extract from the first markdown heading onward
+                // to avoid leaking tool call traces into the PR body
+                const headingMatch = raw.match(/(^|\n)(## .+[\s\S]*)$/);
+                description = headingMatch ? headingMatch[2].trim() : raw.trim();
+              }
 
-            // Update PR body
-            await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-              body: description
-            });
+              // Preserve issue-closing keywords from the existing PR body
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber
+              });
+              const existingBody = pr.body || '';
+              const closingLines = existingBody
+                .split('\n')
+                .filter(line => /^\s*(closes|fixes|resolves)\s*:?\s+/i.test(line))
+                .map(line => line.trim());
+              if (closingLines.length > 0) {
+                // Only append lines not already present in the generated description
+                const missing = closingLines.filter(line => !description.includes(line));
+                if (missing.length > 0) {
+                  description += '\n\n' + missing.join('\n');
+                }
+              }
 
-            console.log(`✅ Updated PR #${prNumber} with generated description`);
+              // Update PR body
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+                body: description
+              });
+
+              console.log(`✅ Updated PR #${prNumber} with generated description`);
+            } catch (error) {
+              core.setFailed(`❌ Failed to update PR description: ${error.message}`);
+            }
 
       - name: Post success comment
         if: ${{ steps.generate.conclusion == 'success' }}
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |
             const prNumber = ${{ steps.validate_pr.outputs.pr_number }};
 
@@ -186,6 +261,7 @@ jobs:
         if: ${{ failure() && steps.generate.conclusion != 'success' }}
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |
             const prNumber = ${{ steps.validate_pr.outputs.pr_number }};
 
@@ -199,13 +275,19 @@ jobs:
       - name: Post summary
         if: always()
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          PR_TITLE: ${{ steps.pr_details.outputs.title }}
+          PR_BRANCH: ${{ steps.pr_details.outputs.branch }}
+          PR_BASE: ${{ steps.pr_details.outputs.base }}
+          PR_CONCLUSION: ${{ steps.generate.conclusion }}
         with:
+          github-token: ${{ steps.app-token.outputs.token || github.token }}
           script: |
-            const prNumber = ${{ steps.validate_pr.outputs.pr_number }};
-            const title = '${{ steps.pr_details.outputs.title }}';
-            const branch = '${{ steps.pr_details.outputs.branch }}';
-            const base = '${{ steps.pr_details.outputs.base }}';
-            const conclusion = '${{ steps.generate.conclusion }}';
+            const prNumber = context.issue.number;
+            const title = process.env.PR_TITLE || 'Unknown';
+            const branch = process.env.PR_BRANCH || 'Unknown';
+            const base = process.env.PR_BASE || 'Unknown';
+            const conclusion = process.env.PR_CONCLUSION || 'failure';
 
             const summary = [
               '## 📝 PR Description Generator',
@@ -229,3 +311,25 @@ jobs:
           set -euo pipefail
           rm -f commits.txt files.txt pr.diff || true
           echo "🧹 Cleaned up temporary files"
+
+      - name: Update check run
+        if: always() && steps.create-check.outputs.check-id != ''
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          CHECK_ID: ${{ steps.create-check.outputs.check-id }}
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const conclusion = process.env.JOB_STATUS === 'cancelled' ? 'cancelled' : process.env.JOB_STATUS === 'success' ? 'success' : 'failure';
+            try {
+              await github.rest.checks.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                check_run_id: parseInt(process.env.CHECK_ID, 10),
+                status: 'completed',
+                conclusion: conclusion,
+                completed_at: new Date().toISOString()
+              });
+            } catch (error) {
+              core.warning(`Failed to update check run: ${error.message}`);
+            }

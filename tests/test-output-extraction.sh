@@ -31,10 +31,12 @@ Scanned 15 commits from the past 2 days. No security vulnerabilities were identi
 EOF
 
 # Extract using the primary method
-if grep -q '^```cagent-output' "$TEST_DIR/output1.log"; then
-  awk '/^```cagent-output$/,/^```$/ {
-    if (!/^```cagent-output$/ && !/^```$/) print
-  }' "$TEST_DIR/output1.log" > "$TEST_DIR/output1.clean"
+if grep -q '```cagent-output' "$TEST_DIR/output1.log"; then
+  awk '
+    /```cagent-output/ { capturing=1; next }
+    capturing && /^```/ { capturing=0; next }
+    capturing { print }
+  ' "$TEST_DIR/output1.log" > "$TEST_DIR/output1.clean"
   echo "✅ Extraction successful"
 else
   echo "❌ cagent-output block not found"
@@ -43,6 +45,52 @@ fi
 echo "Cleaned output:"
 cat "$TEST_DIR/output1.clean"
 echo ""
+
+# Test Case 1b: Code fence NOT at start of line (agent emits thoughts before it)
+echo ""
+echo "Test 1b: Extracting cagent-output when code fence is mid-line"
+echo "---"
+cat > "$TEST_DIR/output1b.log" <<'EOF'
+For any feedback, please visit: https://docker.qualtrics.com/jfe/form/SV_cNsCIg92nQemlfw
+
+time=2025-11-05T21:22:35.664Z level=WARN msg="rootSessionID not set"
+
+--- Agent: root ---
+
+I'll analyze the PR by reading the actual diff and related files to generate a comprehensive description.```cagent-output
+## Summary
+
+Implements automated PR review functionality.
+
+## Changes
+
+### Added
+- New workflow file
+```
+EOF
+
+if grep -q '```cagent-output' "$TEST_DIR/output1b.log"; then
+  awk '
+    /```cagent-output/ { capturing=1; next }
+    capturing && /^```/ { capturing=0; next }
+    capturing { print }
+  ' "$TEST_DIR/output1b.log" > "$TEST_DIR/output1b.clean"
+  echo "✅ Extraction successful"
+else
+  echo "❌ cagent-output block not found"
+fi
+
+echo "Cleaned output:"
+cat "$TEST_DIR/output1b.clean"
+echo ""
+
+# Verify no agent thoughts leaked through
+if grep -q "I'll analyze" "$TEST_DIR/output1b.clean"; then
+  echo "❌ FAIL: Agent thoughts leaked into clean output"
+  exit 1
+else
+  echo "✅ Agent thoughts correctly excluded"
+fi
 
 # Test Case 2: Fallback - Extract after agent marker
 echo ""
@@ -123,6 +171,89 @@ else
   echo "⚠️  AGENT_LINE is empty (defensive check would prevent arithmetic error)"
   cp "$TEST_DIR/output4.log" "$TEST_DIR/output4.clean"
 fi
+
+# Test Case 5: Strip "Calling function()" and "function response →" blocks
+echo ""
+echo "Test 5: Strip Calling/response tool trace blocks"
+echo "---"
+cat > "$TEST_DIR/output5.log" <<'EOF'
+Calling read_multiple_files(
+  paths: [
+  "pr.diff",
+  "commits.txt"
+]
+)
+
+read_multiple_files response → (
+=== pr.diff ===
+diff --git a/file.txt b/file.txt
++hello
+)
+
+## Summary
+
+This PR adds a greeting.
+
+## Changes
+
+- Added hello to file.txt
+EOF
+
+# Run the same AWK filter used in action.yml
+awk '
+  /<thinking>/,/<\/thinking>/ { next }
+  /^\[thinking\]/,/^\[\/thinking\]/ { next }
+  /^Thinking:/ { next }
+  /^--- Tool:/ { in_tool=1; next }
+  in_tool && /^--- (Tool:|Agent:|$)/ { in_tool=0; next }
+  in_tool { next }
+  /^Calling [a-zA-Z_]+\(/ { in_call=1; next }
+  in_call && /^\)$/ { in_call=0; next }
+  in_call { next }
+  /^[a-zA-Z_]+ response →/ { in_resp=1; next }
+  in_resp && /^\)$/ { in_resp=0; next }
+  in_resp { next }
+  /^--- Agent:/ { next }
+  /^time=/ { next }
+  /^level=/ { next }
+  /^msg=/ { next }
+  /^> \[!NOTE\]/ { next }
+  /For any feedback/ { next }
+  /transfer_task/ { next }
+  /Delegating to/ { next }
+  /Task delegated/ { next }
+  NF==0 && !seen_content { next }
+  NF>0 { seen_content=1 }
+  { print }
+' "$TEST_DIR/output5.log" > "$TEST_DIR/output5.clean"
+
+echo "Cleaned output:"
+cat "$TEST_DIR/output5.clean"
+echo ""
+
+# Verify tool traces were stripped
+if grep -q "Calling read_multiple_files" "$TEST_DIR/output5.clean"; then
+  echo "❌ FAIL: 'Calling read_multiple_files' was not stripped"
+  exit 1
+fi
+if grep -q "read_multiple_files response" "$TEST_DIR/output5.clean"; then
+  echo "❌ FAIL: 'read_multiple_files response' was not stripped"
+  exit 1
+fi
+if grep -q "diff --git" "$TEST_DIR/output5.clean"; then
+  echo "❌ FAIL: Diff content inside response block was not stripped"
+  exit 1
+fi
+# Verify actual content survived
+if ! grep -q "## Summary" "$TEST_DIR/output5.clean"; then
+  echo "❌ FAIL: '## Summary' heading was stripped (should be kept)"
+  exit 1
+fi
+if ! grep -q "This PR adds a greeting." "$TEST_DIR/output5.clean"; then
+  echo "❌ FAIL: Description body was stripped (should be kept)"
+  exit 1
+fi
+echo "✅ Tool trace blocks correctly stripped, markdown content preserved"
 
 echo ""
 echo "=========================================="

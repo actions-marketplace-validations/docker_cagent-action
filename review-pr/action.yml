@@ -1,0 +1,663 @@
+name: "PR Review with cagent"
+description: "AI-powered pull request review with automatic learning from feedback"
+author: "Docker"
+
+inputs:
+  pr-number:
+    description: "Pull request number to review (auto-detected from github.event if not provided)"
+    required: false
+    default: ""
+  comment-id:
+    description: "Comment ID for reactions (auto-detected from github.event if not provided)"
+    required: false
+    default: ""
+  additional-prompt:
+    description: "Additional instructions appended to the review (e.g., language-specific patterns, project conventions)"
+    required: false
+    default: ""
+  anthropic-api-key:
+    description: "Anthropic API key"
+    required: false
+  openai-api-key:
+    description: "OpenAI API key"
+    required: false
+  google-api-key:
+    description: "Google API key for Gemini models"
+    required: false
+  aws-bearer-token-bedrock:
+    description: "AWS Bearer token for Bedrock models"
+    required: false
+  xai-api-key:
+    description: "xAI API key for Grok models"
+    required: false
+  nebius-api-key:
+    description: "Nebius API key"
+    required: false
+  mistral-api-key:
+    description: "Mistral API key"
+    required: false
+  github-token:
+    description: "GitHub token for API access (overridden if github-app-id is provided)"
+    required: false
+  github-app-id:
+    description: "GitHub App ID for custom app identity (comments/reviews will appear as the app)"
+    required: false
+  github-app-private-key:
+    description: "GitHub App private key (required if github-app-id is provided)"
+    required: false
+  model:
+    description: "Model to use for reviews (e.g., anthropic/claude-sonnet-4-5, openai/gpt-4o)"
+    required: false
+    default: ""
+  add-prompt-files:
+    description: "Comma-separated list of files to append to the prompt (e.g., 'AGENTS.md,CLAUDE.md')"
+    required: false
+    default: ""
+  trusted-bot-app-id:
+    description: "GitHub App ID of a trusted bot that can bypass comment-based auth checks"
+    required: false
+    default: ""
+
+outputs:
+  exit-code:
+    description: "Exit code from the review"
+    value: ${{ steps.run-review.outputs.exit-code }}
+  review-url:
+    description: "URL to the posted review"
+    value: ${{ steps.post-summary.outputs.review-url }}
+
+runs:
+  using: "composite"
+  steps:
+    # ========================================
+    # SETUP
+    # ========================================
+    - name: Resolve PR number and comment ID
+      id: resolve-context
+      shell: bash
+      run: |
+        # Resolve PR number: input > pull_request event > issue event
+        PR_NUMBER="${{ inputs.pr-number }}"
+        if [ -z "$PR_NUMBER" ]; then
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+        fi
+        if [ -z "$PR_NUMBER" ]; then
+          PR_NUMBER="${{ github.event.issue.number }}"
+        fi
+        if [ -z "$PR_NUMBER" ]; then
+          echo "❌ Could not determine PR number. Provide pr-number input or trigger from a PR event."
+          exit 1
+        fi
+        echo "pr-number=$PR_NUMBER" >> $GITHUB_OUTPUT
+        echo "✅ Resolved PR number: $PR_NUMBER"
+
+        # Resolve comment ID: input > comment event (optional, for reactions)
+        COMMENT_ID="${{ inputs.comment-id }}"
+        if [ -z "$COMMENT_ID" ]; then
+          COMMENT_ID="${{ github.event.comment.id }}"
+        fi
+        echo "comment-id=$COMMENT_ID" >> $GITHUB_OUTPUT
+        if [ -n "$COMMENT_ID" ]; then
+          echo "✅ Resolved comment ID: $COMMENT_ID"
+        else
+          echo "ℹ️  No comment ID - reactions will be skipped"
+        fi
+
+    # Generate GitHub App token if credentials are provided
+    # This allows comments/reviews to appear as the custom app instead of github-actions[bot]
+    - name: Generate GitHub App token
+      id: app-token
+      if: inputs.github-app-id != ''
+      uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2
+      with:
+        app_id: ${{ inputs.github-app-id }}
+        private_key: ${{ inputs.github-app-private-key }}
+
+    # Resolve which token to use: app token > explicit github-token > default github.token
+    - name: Resolve GitHub token
+      id: resolve-token
+      shell: bash
+      run: |
+        if [ -n "$APP_TOKEN" ]; then
+          echo "✅ Using GitHub App token"
+          echo "token=$APP_TOKEN" >> $GITHUB_OUTPUT
+        elif [ -n "$EXPLICIT_TOKEN" ]; then
+          echo "✅ Using provided github-token"
+          echo "token=$EXPLICIT_TOKEN" >> $GITHUB_OUTPUT
+        else
+          echo "ℹ️  Using default github.token"
+          echo "token=$DEFAULT_TOKEN" >> $GITHUB_OUTPUT
+        fi
+      env:
+        APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        EXPLICIT_TOKEN: ${{ inputs.github-token }}
+        DEFAULT_TOKEN: ${{ github.token }}
+
+    - name: Add eyes reaction
+      if: steps.resolve-context.outputs.comment-id != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.resolve-token.outputs.token }}
+      run: |
+        gh api repos/${{ github.repository }}/issues/comments/${{ steps.resolve-context.outputs.comment-id }}/reactions \
+          -X POST -f content='eyes' || true
+
+    - name: Get PR information
+      id: pr-info
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.resolve-token.outputs.token }}
+        PR_NUMBER: ${{ steps.resolve-context.outputs.pr-number }}
+        REPO: ${{ github.repository }}
+        READ_TOKEN: ${{ github.token }}
+      run: |
+        PR_URL="https://github.com/${REPO}/pull/${PR_NUMBER}"
+
+        gh pr view "$PR_URL" --json files -q '.files[].path' > changed_files.txt
+        gh pr view "$PR_URL" --json title,body,author,baseRefName,headRefName > pr_metadata.json
+        echo "files_count=$(wc -l < changed_files.txt | tr -d ' ')" >> $GITHUB_OUTPUT
+
+        # Pre-fetch diff for the agent so it doesn't need to call gh pr diff itself.
+        # Uses github.token (has contents:read) instead of the App token (used for posting reviews).
+        # Uses the full PR URL instead of just the number — gh can't resolve a bare number
+        # from a detached HEAD (refs/pull/N/head).
+        if GH_TOKEN="$READ_TOKEN" gh pr diff "$PR_URL" > pr.diff 2>pr_diff_stderr.txt; then
+          echo "✅ Pre-fetched PR diff via gh pr diff ($(wc -l < pr.diff | tr -d ' ') lines)"
+          rm -f pr_diff_stderr.txt
+        else
+          echo "::warning::gh pr diff failed: $(cat pr_diff_stderr.txt 2>/dev/null)"
+          rm -f pr.diff pr_diff_stderr.txt
+
+          # Fallback: git diff with merge-base (repo is checked out with full history)
+          MERGE_BASE=$(git merge-base origin/main HEAD 2>/dev/null || git merge-base origin/master HEAD 2>/dev/null || echo "")
+          if [ -n "$MERGE_BASE" ]; then
+            if git diff "$MERGE_BASE"...HEAD > pr.diff; then
+              echo "✅ Pre-fetched PR diff via git diff ($(wc -l < pr.diff | tr -d ' ') lines)"
+            else
+              echo "::warning::git diff failed — agent will fetch diff itself"
+              rm -f pr.diff
+            fi
+          else
+            echo "::warning::Could not determine merge base — agent will fetch diff itself"
+          fi
+        fi
+
+    - name: Generate file history
+      if: hashFiles('changed_files.txt') != ''
+      shell: bash
+      run: |
+        > /tmp/file_history.txt
+        while IFS= read -r file; do
+          # Skip new files (no git history)
+          HISTORY=$(git log --oneline -5 -- "$file" 2>/dev/null || true)
+          if [ -n "$HISTORY" ]; then
+            echo "## $file" >> /tmp/file_history.txt
+            echo "$HISTORY" >> /tmp/file_history.txt
+            echo "" >> /tmp/file_history.txt
+          fi
+        done < changed_files.txt
+
+        ENTRIES=$(grep -c '^## ' /tmp/file_history.txt 2>/dev/null || echo "0")
+        echo "✅ Generated history for $ENTRIES file(s)"
+
+    - name: Resolve stale review threads
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.resolve-token.outputs.token }}
+        PR_NUMBER: ${{ steps.resolve-context.outputs.pr-number }}
+        REPO: ${{ github.repository }}
+      run: |
+        echo "🔍 Checking for stale bot review threads to resolve..."
+
+        # A. Parse diff → file:line set
+        # Tracks current file from "diff --git" headers, line numbers from @@ hunks,
+        # and emits "file:line" for each added (+) line.
+        if [ ! -f pr.diff ]; then
+          echo "ℹ️  No pr.diff found — skipping stale thread resolution"
+          exit 0
+        fi
+
+        DIFF_LINES_FILE=$(mktemp)
+        trap "rm -f '$DIFF_LINES_FILE'" EXIT
+
+        awk '
+          /^\+\+\+ b\// {
+            # Extract file path from "+++ b/foo" (unambiguous, unlike diff --git header)
+            file = substr($0, 7)
+          }
+          /^@@ / {
+            # Parse new file line number from "@@ -X,Y +Z,W @@"
+            match($0, /\+([0-9]+)/, arr)
+            line = arr[1]
+            next
+          }
+          /^\+[^+]/ || /^\+$/ {
+            # Added line (but not the +++ header)
+            if (file != "" && line > 0) {
+              print file ":" line
+            }
+            line++
+          }
+          /^ / { line++ }
+          /^-/ { next }
+        ' pr.diff | sort -u > $DIFF_LINES_FILE
+
+        DIFF_LINE_COUNT=$(wc -l < $DIFF_LINES_FILE | tr -d ' ')
+        echo "📄 Found $DIFF_LINE_COUNT unique file:line pairs in diff"
+
+        # B. Fetch all review threads via GraphQL (paginated)
+        OWNER="${REPO%%/*}"
+        REPO_NAME="${REPO##*/}"
+
+        QUERY='
+        query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $pr) {
+              reviewThreads(first: 100, after: $cursor) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  id
+                  isResolved
+                  path
+                  line
+                  comments(first: 5) {
+                    nodes { body }
+                  }
+                }
+              }
+            }
+          }
+        }'
+
+        ALL_THREADS="[]"
+        CURSOR=""
+        PAGE=0
+        FETCH_OK=true
+
+        while true; do
+          PAGE=$((PAGE + 1))
+
+          GQL_ARGS=(-f query="$QUERY" -f owner="$OWNER" -f repo="$REPO_NAME" -F pr="$PR_NUMBER")
+          if [ -n "$CURSOR" ]; then
+            GQL_ARGS+=(-f cursor="$CURSOR")
+          fi
+
+          RESULT=$(gh api graphql "${GQL_ARGS[@]}" 2>&1) || {
+            echo "::warning::GraphQL query failed (page $PAGE): $RESULT"
+            FETCH_OK=false
+            break
+          }
+
+          # Check for GraphQL errors in response (HTTP 200 can still contain errors)
+          if echo "$RESULT" | jq -e '.errors' > /dev/null 2>&1; then
+            echo "::warning::GraphQL returned errors: $(echo "$RESULT" | jq -c '.errors')"
+            FETCH_OK=false
+            break
+          fi
+
+          THREADS=$(echo "$RESULT" | jq '.data.repository.pullRequest.reviewThreads.nodes // []') || {
+            echo "::warning::Failed to parse threads on page $PAGE"
+            FETCH_OK=false
+            break
+          }
+          ALL_THREADS=$(echo "$ALL_THREADS" "$THREADS" | jq -s '.[0] + .[1]') || {
+            echo "::warning::Failed to merge threads on page $PAGE"
+            FETCH_OK=false
+            break
+          }
+
+          HAS_NEXT=$(echo "$RESULT" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage')
+          if [ "$HAS_NEXT" != "true" ]; then
+            break
+          fi
+          CURSOR=$(echo "$RESULT" | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor')
+        done
+
+        if [ "$FETCH_OK" != "true" ]; then
+          echo "::warning::Thread fetch incomplete — skipping resolution to avoid acting on partial data"
+          exit 0
+        fi
+
+        TOTAL_THREADS=$(echo "$ALL_THREADS" | jq 'length')
+        echo "📋 Fetched $TOTAL_THREADS review threads (across $PAGE page(s))"
+
+        # C. Filter to unresolved bot threads (containing <!-- cagent-review --> marker)
+        BOT_THREADS=$(echo "$ALL_THREADS" | jq '[
+          .[] | select(
+            .isResolved == false and
+            (.comments.nodes | any(.body | contains("<!-- cagent-review -->")))
+          )
+        ]')
+
+        BOT_COUNT=$(echo "$BOT_THREADS" | jq 'length')
+        if [ -z "$BOT_COUNT" ] || ! [[ "$BOT_COUNT" =~ ^[0-9]+$ ]]; then
+          echo "::warning::Failed to count bot threads"
+          exit 0
+        fi
+        echo "🤖 Found $BOT_COUNT unresolved bot review thread(s)"
+
+        if [ "$BOT_COUNT" -eq 0 ]; then
+          echo "✅ No stale bot threads to resolve"
+          exit 0
+        fi
+
+        # D. Resolve stale threads (file:line no longer in diff)
+        RESOLVED=0
+        KEPT=0
+
+        for i in $(seq 0 $((BOT_COUNT - 1))); do
+          THREAD_ID=$(echo "$BOT_THREADS" | jq -r ".[$i].id")
+          THREAD_PATH=$(echo "$BOT_THREADS" | jq -r ".[$i].path")
+          THREAD_LINE=$(echo "$BOT_THREADS" | jq -r ".[$i].line")
+
+          # Skip threads with null path (file-level or unknown context)
+          if [ "$THREAD_PATH" = "null" ] || [ -z "$THREAD_PATH" ]; then
+            echo "  ⏭️  Keeping open: thread $THREAD_ID (no file path)"
+            KEPT=$((KEPT + 1))
+            continue
+          fi
+
+          # Null line means GitHub marked the comment "outdated" — the code changed
+          # since the comment was posted and the position is no longer valid.
+          # These are stale by definition and should be resolved.
+          SHOULD_RESOLVE=false
+          if [ "$THREAD_LINE" = "null" ] || [ -z "$THREAD_LINE" ]; then
+            echo "  🔄 Outdated: $THREAD_PATH (position invalidated by push)"
+            SHOULD_RESOLVE=true
+          elif grep -qFx "${THREAD_PATH}:${THREAD_LINE}" "$DIFF_LINES_FILE"; then
+            echo "  ⏭️  Keeping open: ${THREAD_PATH}:${THREAD_LINE} (still in diff)"
+            KEPT=$((KEPT + 1))
+          else
+            echo "  🔄 Stale: ${THREAD_PATH}:${THREAD_LINE} (no longer in diff)"
+            SHOULD_RESOLVE=true
+          fi
+
+          if [ "$SHOULD_RESOLVE" = "true" ]; then
+            MUTATION_RESULT=$(gh api graphql -f query='
+              mutation($threadId: ID!) {
+                resolveReviewThread(input: { threadId: $threadId }) {
+                  thread { id isResolved }
+                }
+              }
+            ' -f threadId="$THREAD_ID" 2>&1) || {
+              echo "  ⚠️  Failed to resolve thread $THREAD_ID (API error)"
+              continue
+            }
+
+            if echo "$MUTATION_RESULT" | jq -e '.errors' > /dev/null 2>&1; then
+              echo "  ⚠️  Failed to resolve thread $THREAD_ID: $(echo "$MUTATION_RESULT" | jq -c '.errors')"
+              continue
+            fi
+
+            echo "  ✅ Resolved thread $THREAD_ID"
+            RESOLVED=$((RESOLVED + 1))
+          fi
+        done
+
+        echo ""
+        echo "📋 Summary: Resolved $RESOLVED thread(s), kept $KEPT thread(s) open"
+
+    - name: Ensure cache directory exists
+      shell: bash
+      run: mkdir -p "${{ github.workspace }}/.cache"
+
+    - name: Restore reviewer memory
+      id: restore-memory
+      uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      with:
+        path: ${{ github.workspace }}/.cache/pr-review-memory.db
+        key: pr-review-memory-${{ github.repository }}-${{ github.job }}-${{ github.run_id }}
+        restore-keys: |
+          pr-review-memory-${{ github.repository }}-${{ github.job }}-
+          pr-review-memory-${{ github.repository }}-
+
+    # ========================================
+    # PROCESS PENDING FEEDBACK
+    # Downloads feedback artifacts left by capture-feedback jobs
+    # and processes them into memory before the review runs.
+    # ========================================
+    - name: Collect pending feedback
+      id: pending-feedback
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.resolve-token.outputs.token }}
+      run: |
+        ARTIFACTS=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=pr-review-feedback" \
+          --jq '.artifacts[].id' 2>/dev/null || echo "")
+
+        if [ -z "$ARTIFACTS" ]; then
+          echo "has_feedback=false" >> $GITHUB_OUTPUT
+          echo "ℹ️  No pending feedback to process"
+          exit 0
+        fi
+
+        mkdir -p pending_feedback
+        COMBINED=""
+        COUNT=0
+
+        for AID in $ARTIFACTS; do
+          # Download artifact zip
+          gh api "repos/${{ github.repository }}/actions/artifacts/$AID/zip" > "feedback_$AID.zip" 2>/dev/null || continue
+          unzip -o "feedback_$AID.zip" -d "pending_feedback/" 2>/dev/null || continue
+
+          if [ -f pending_feedback/feedback.json ]; then
+            FB_PATH=$(jq -r '.path // "unknown"' pending_feedback/feedback.json)
+            FB_LINE=$(jq -r '.line // "?"' pending_feedback/feedback.json)
+            FB_BODY=$(jq -r '.body // ""' pending_feedback/feedback.json)
+
+            COMBINED+="- **File:** ${FB_PATH} (line ${FB_LINE})"$'\n'
+            COMBINED+="  **Feedback:** ${FB_BODY}"$'\n\n'
+            ((COUNT++)) || true
+          fi
+
+          rm -f pending_feedback/feedback.json
+
+          # Delete processed artifact
+          gh api "repos/${{ github.repository }}/actions/artifacts/$AID" -X DELETE 2>/dev/null || true
+        done
+
+        if [ "$COUNT" -gt 0 ]; then
+          echo "has_feedback=true" >> $GITHUB_OUTPUT
+          {
+            echo "prompt<<FEEDBACK_EOF"
+            echo "$COMBINED"
+            echo "FEEDBACK_EOF"
+          } >> $GITHUB_OUTPUT
+          echo "✅ Found $COUNT pending feedback item(s) to process"
+        else
+          echo "has_feedback=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Process pending feedback
+      if: steps.pending-feedback.outputs.has_feedback == 'true'
+      continue-on-error: true
+      uses: docker/cagent-action@latest
+      with:
+        agent: ${{ github.action_path }}/agents/pr-review-feedback.yaml
+        prompt: |
+          Developers left feedback on previous review comments. Learn from each item:
+
+          ${{ steps.pending-feedback.outputs.prompt }}
+
+          For each item:
+          1. If they're correcting a false positive, add a memory to avoid this mistake
+          2. If they're asking for clarification, note what was unclear
+          3. If they're agreeing and adding context, store the additional insight
+
+          Use add_memory to record what you learned from each feedback item.
+        anthropic-api-key: ${{ inputs.anthropic-api-key }}
+        openai-api-key: ${{ inputs.openai-api-key }}
+        google-api-key: ${{ inputs.google-api-key }}
+        aws-bearer-token-bedrock: ${{ inputs.aws-bearer-token-bedrock }}
+        xai-api-key: ${{ inputs.xai-api-key }}
+        nebius-api-key: ${{ inputs.nebius-api-key }}
+        mistral-api-key: ${{ inputs.mistral-api-key }}
+        github-token: ${{ steps.resolve-token.outputs.token }}
+        trusted-bot-app-id: ${{ inputs.trusted-bot-app-id }}
+        extra-args: ${{ inputs.model && format('--model={0}', inputs.model) || '' }}
+        skip-summary: "true"
+
+    # ========================================
+    # BUILD REVIEW CONTEXT
+    # ========================================
+    - name: Build review context
+      id: context
+      shell: bash
+      env:
+        PR_NUMBER: ${{ steps.resolve-context.outputs.pr-number }}
+        EXTRA_PROMPT: ${{ inputs.additional-prompt }}
+        REPO: ${{ github.repository }}
+      run: |
+        title=$(jq -r '.title' pr_metadata.json)
+        author=$(jq -r '.author.login' pr_metadata.json)
+        body=$(jq -r '.body // "No description provided."' pr_metadata.json)
+        base=$(jq -r '.baseRefName' pr_metadata.json)
+        head=$(jq -r '.headRefName' pr_metadata.json)
+        files_count=$(wc -l < changed_files.txt | tr -d ' ')
+
+        # Build review context (using echo to avoid YAML heredoc parsing issues)
+        {
+          echo "# Pull Request Review Request"
+          echo ""
+          echo "## PR Information"
+          echo "- **URL**: https://github.com/${REPO}/pull/${PR_NUMBER}"
+          echo "- **Title**: $title"
+          echo "- **Author**: $author"
+          echo "- **Branch**: $head → $base"
+          echo "- **Files Changed**: $files_count"
+          echo ""
+          echo "## PR Description"
+          echo "$body"
+          echo ""
+          echo "## Changed Files"
+          echo ""
+          cat changed_files.txt
+          echo ""
+          echo "---"
+          echo ""
+          echo "## Instructions"
+          echo ""
+          echo "Execute the review pipeline:"
+          echo ""
+          echo "1. **Gather**: Read the pre-fetched \`pr.diff\` file. If missing, run \`gh pr diff https://github.com/${REPO}/pull/${PR_NUMBER}\` (use the full URL, not just the number)"
+          echo '2. **Draft**: Delegate to `drafter` agent to generate bug hypotheses'
+          echo '3. **Verify**: For each hypothesis, delegate to `verifier` agent'
+          echo '4. **Post**: Aggregate findings and post review via `gh api`'
+          echo ""
+          echo "Only report CONFIRMED and LIKELY findings. Always post as COMMENT (never APPROVE or REQUEST_CHANGES)."
+        } > review_context.md
+
+        # Append extra prompt if provided
+        if [ -n "$EXTRA_PROMPT" ]; then
+          {
+            echo ""
+            echo "## Additional Guidelines"
+            echo ""
+            echo "$EXTRA_PROMPT"
+          } >> review_context.md
+        fi
+
+        # Save prompt to output for the action
+        {
+          echo "review_prompt<<PROMPT_EOF"
+          cat review_context.md
+          echo "PROMPT_EOF"
+        } >> $GITHUB_OUTPUT
+
+    # ========================================
+    # RUN REVIEW using root cagent-action
+    # ========================================
+    - name: Run PR Review
+      id: run-review
+      uses: docker/cagent-action@latest
+      with:
+        agent: ${{ github.action_path }}/agents/pr-review.yaml
+        prompt: ${{ steps.context.outputs.review_prompt }}
+        timeout: "2400"  # 40 min — allows time for large diffs and retries
+        anthropic-api-key: ${{ inputs.anthropic-api-key }}
+        openai-api-key: ${{ inputs.openai-api-key }}
+        google-api-key: ${{ inputs.google-api-key }}
+        aws-bearer-token-bedrock: ${{ inputs.aws-bearer-token-bedrock }}
+        xai-api-key: ${{ inputs.xai-api-key }}
+        nebius-api-key: ${{ inputs.nebius-api-key }}
+        mistral-api-key: ${{ inputs.mistral-api-key }}
+        github-token: ${{ steps.resolve-token.outputs.token }}
+        trusted-bot-app-id: ${{ inputs.trusted-bot-app-id }}
+        extra-args: ${{ inputs.model && format('--model={0}', inputs.model) || '' }}
+        add-prompt-files: ${{ inputs.add-prompt-files }}
+        max-retries: "0"  # Disable retries — the review agent recovers internally (root falls back when sub-agents fail), so retrying the pipeline produces duplicate reviews
+        skip-summary: "true"
+
+    - name: Save reviewer memory
+      if: always()
+      continue-on-error: true  # Don't fail if memory file doesn't exist (first run)
+      uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      with:
+        path: ${{ github.workspace }}/.cache/pr-review-memory.db
+        key: pr-review-memory-${{ github.repository }}-${{ github.job }}-${{ github.run_id }}
+
+    # ========================================
+    # POST-REVIEW: Clean summary & reactions
+    # ========================================
+    - name: Post clean summary
+      id: post-summary
+      if: always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.resolve-token.outputs.token }}
+        PR_NUMBER: ${{ steps.resolve-context.outputs.pr-number }}
+        REPOSITORY: ${{ github.repository }}
+        EXIT_CODE: ${{ steps.run-review.outputs.exit-code }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        VERBOSE_LOG_FILE: ${{ steps.run-review.outputs.verbose-log-file }}
+      run: |
+        REVIEW_URL="https://github.com/$REPOSITORY/pull/$PR_NUMBER"
+        echo "review-url=$REVIEW_URL" >> $GITHUB_OUTPUT
+
+        if [ "$EXIT_CODE" != "0" ]; then
+          # Check if agent actually posted a review despite the error exit code.
+          # This happens when a sub-agent fails (e.g., API overload) but the root
+          # agent recovers and posts the review itself.
+          if [ -n "$VERBOSE_LOG_FILE" ] && grep -qE 'pullrequestreview-[0-9]+' "$VERBOSE_LOG_FILE" 2>/dev/null; then
+            echo "::warning::Agent exited $EXIT_CODE but a review was posted — treating as partial success"
+            STATUS="⚠️ **Review completed with warnings** (exit code: $EXIT_CODE)"
+          else
+            STATUS="❌ **Review failed** (exit code: $EXIT_CODE)"
+            if ! gh api "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
+              -f body="❌ **PR Review Failed** — The review agent encountered an error and could not complete the review. [View logs]($RUN_URL)." \
+              2>&1; then
+              echo "::warning::Failed to post fallback comment to PR"
+            fi
+          fi
+        else
+          STATUS="✅ **Review completed**"
+        fi
+
+        # Override the default summary with a cleaner one for PR reviews
+        {
+          echo ""
+          echo "---"
+          echo ""
+          echo "## PR Review Summary"
+          echo ""
+          echo "$STATUS"
+          echo ""
+          echo "📝 [View Pull Request #$PR_NUMBER]($REVIEW_URL)"
+        } >> $GITHUB_STEP_SUMMARY
+
+    - name: Add completion reaction
+      if: steps.resolve-context.outputs.comment-id != '' && always()
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.resolve-token.outputs.token }}
+        EXIT_CODE: ${{ steps.run-review.outputs.exit-code }}
+      run: |
+        if [ "$EXIT_CODE" != "0" ]; then
+          gh api "repos/${{ github.repository }}/issues/comments/${{ steps.resolve-context.outputs.comment-id }}/reactions" \
+            -X POST -f content='confused' || true
+        else
+          gh api "repos/${{ github.repository }}/issues/comments/${{ steps.resolve-context.outputs.comment-id }}/reactions" \
+            -X POST -f content='+1' || true
+        fi
